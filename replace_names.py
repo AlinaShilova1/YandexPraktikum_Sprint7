@@ -171,8 +171,7 @@ def generate_aliases(mapping: dict):
     for k, v in mapping.items():
         ks, vs = k.split(), v.split()
         if len(ks)==2 and len(vs)==2 and ks[0][0].isupper() and ks[1][0].isupper():
-
-pairs.append((ks,vs))
+            pairs.append((ks,vs))
             first_count[ks[0]] += 1
             last_count[ks[1]]  += 1
     new = {}
@@ -354,3 +353,4 @@ def main():
 
     in_dir = Path(args.in_dir)
     seed = load_seed(args.seed_mapping) if args.seed_mapping else {}
+
