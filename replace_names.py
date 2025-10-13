@@ -1,16 +1,38 @@
 # -*- coding: utf-8 -*-
+
+# --- Py3.11+/3.12 compat shim for pymorphy2 (uses inspect.getargspec internally) ---
+import inspect
+from collections import namedtuple
+from inspect import signature, Parameter
+
+if not hasattr(inspect, "getargspec"):
+    ArgSpec = namedtuple("ArgSpec", "args varargs keywords defaults")
+    def _getargspec(func):
+        sig = signature(func)
+        params = list(sig.parameters.values())
+        args = [p.name for p in params
+                if p.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
+                and p.default is Parameter.empty]
+        # позиционные с дефолтами
+        args_with_defaults = [p.name for p in params
+                              if p.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
+                              and p.default is not Parameter.empty]
+        varargs = next((p.name for p in params if p.kind == Parameter.VAR_POSITIONAL), None)
+        varkw  = next((p.name for p in params if p.kind == Parameter.VAR_KEYWORD), None)
+        defaults = tuple(p.default for p in params
+                         if p.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
+                         and p.default is not Parameter.empty) or None
+        # старый getargspec возвращал ВСЕ позиционные в args + defaults отдельно
+        return ArgSpec(args + args_with_defaults, varargs, varkw, defaults)
+    inspect.getargspec = _getargspec
+# -------------------------------------------------------------------------------
+
+import pymorphy2
+morph = pymorphy2.MorphAnalyzer()
 import argparse, json, os, re, sys, random
 from pathlib import Path
 from collections import defaultdict, Counter
 from difflib import SequenceMatcher
-
-try:
-    import pymorphy2
-except ImportError:
-    print("ERROR: Требуется pymorphy2. Установите: pip install pymorphy2 pymorphy2-dicts-ru", file=sys.stderr)
-    sys.exit(1)
-
-morph = pymorphy2.MorphAnalyzer()
 random.seed(42)  # детерминированность генерации
 
 # ---------- утилиты ----------
@@ -369,4 +391,5 @@ def main():
 
 if name == "main":
     main()
+
 
