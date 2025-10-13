@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
-import argparse, json, os, re, sys, random, warnings
+import argparse, json, os, re, sys, random, warnings, time
 from pathlib import Path
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
+from functools import lru_cache
 
 # ---------------- Morph init: prefer pymorphy3 (fast, Py3.12-friendly) ----------------
 morph = None
 USING_MORPH3 = False
+t0 = time.time()
 try:
     from pymorphy3 import MorphAnalyzer as MorphAnalyzer3
     morph = MorphAnalyzer3()
     USING_MORPH3 = True
-except Exception:
+    print(f"[DEBUG] Morph: pymorphy3 initialized in {time.time()-t0:.2f}s", file=sys.stderr)
+except Exception as e:
+    print(f"[WARN] pymorphy3 init failed: {e!r}. Falling back to pymorphy2…", file=sys.stderr)
     import inspect
     from collections import namedtuple
     from inspect import signature, Parameter
@@ -35,8 +39,10 @@ except Exception:
         inspect.getargspec = _getargspec  # type: ignore
 
     warnings.filterwarnings("ignore", message="pkg_resources is deprecated", module="pymorphy2")
+    t1 = time.time()
     import pymorphy2
     morph = pymorphy2.MorphAnalyzer()
+    print(f"[DEBUG] Morph: pymorphy2 initialized in {time.time()-t1:.2f}s", file=sys.stderr)
 # -------------------------------------------------------------------------------------
 
 random.seed(42)
@@ -48,6 +54,8 @@ def is_word(tok: str) -> bool: return bool(re.match(r'^[A-Za-zА-Яа-яЁё0-9]
 def is_space(tok: str) -> bool: return tok.isspace()
 def is_hyphen(tok: str) -> bool: return tok in ('-','–','—')
 
+# ---- лемматизация с кэшем (сильно ускоряет) ----
+@lru_cache(maxsize=200000)
 def lemmatize(word: str) -> str:
     return morph.parse(word)[0].normal_form
 
@@ -66,7 +74,13 @@ def load_seed_mapping(path_str: str):
         return {}
     cleaned = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
     cleaned = re.sub(r"(?m)^\s*//.*?$", "", cleaned)
-    return json.loads(cleaned)
+    try:
+        data = json.loads(cleaned)
+        return data
+    except json.JSONDecodeError as e:
+        head = cleaned[:160].replace("\n", "↩")
+        print(f"[ERROR] Некорректный JSON в {p}: {e}. Начало: {head}", file=sys.stderr)
+        raise
 
 def base_key(s: str) -> str:
     s2 = s.strip().lower()
@@ -80,7 +94,6 @@ SYL_MID   = ["ни","ро","ва","кси","лор","ви","тра","мен","н
 SYL_LAST  = ["н","с","р","ль","в","кс","рр","м","рд","т","нн","сс","рт","нд","льд"]
 SUF_PERSON_LAST = ["ов","ев","ин","ик","нер","вик","кроу","драк","восс","кальд","лорн","вирт","мидсон","стерн"]
 SUF_PLACE  = ["ия","ана","ория","нвель","бург","хейм","стан","град","поль","вилль"]
-
 SUF_ORG    = [" Альянса"," Орден"," Синдикат"," Корпорация"," Консорциум"," Легион"]
 SUF_TECH   = [" Кристалл"," Сфера"," Жезл"," Рукавица"," Барьер"," Модуль"]
 SUF_EVENT  = [" Война"," Сражение"," Осада"," Инцидент"," Противостояние"]
@@ -155,12 +168,15 @@ MARVEL_HINTS = [
 
 def extract_candidates(text: str):
     cands = Counter()
+    # 1) хинты
     for rx in MARVEL_HINTS:
         for m in re.finditer(rx, text, flags=re.I | re.U):
             cands[m.group(0)] += 1
+    # 2) Proper-case последовательности
     for m in re.finditer(r'\b([A-ZА-ЯЁ][a-zа-яё]+(?:[- ][A-ZА-ЯЁa-zа-яё]+)+)\b', text, flags=re.U):
         s = m.group(1).strip()
         cands[s] += 1
+    # 3) одиночные маркеры
     for m in re.finditer(r'\b(Мстители|ЩИТ|Гидра|Рафт|Асгард|Ваканда|Соковия|Камень|Камни|Вибраниум)\b', text, flags=re.U|re.I):
         cands[m.group(1)] += 1
     return [k for k, _ in cands.items() if len(k) >= 2]
@@ -187,9 +203,17 @@ def build_mapping_for_folder(in_dir: Path, seed: dict, fuzzy_threshold: float):
     mapping = dict(seed) if seed else {}
     seen_new = {}
 
-    for p in sorted(in_dir.glob("*.txt")):
+    files = sorted(in_dir.glob("*.txt"))
+    print(f"[DEBUG] найдено файлов: {len(files)} в {in_dir}", file=sys.stderr)
+
+    for idx, p in enumerate(files, 1):
+        print(f"[DEBUG] [{idx}/{len(files)}] читаю: {p.name}", file=sys.stderr)
         text = p.read_text(encoding="utf-8", errors="ignore")
+        print(f"[DEBUG] длина текста: {len(text):,} символов", file=sys.stderr)
+
         cands = extract_candidates(text)
+        print(f"[DEBUG] кандидат(ов) извлечено: {len(cands)}", file=sys.stderr)
+
         for cand in cands:
             bk = base_key(cand)
             found_key = None
@@ -201,10 +225,12 @@ def build_mapping_for_folder(in_dir: Path, seed: dict, fuzzy_threshold: float):
                     found_key = sorted(sim_hits, key=lambda k: -similarity(base_key(k), bk))[0]
             if found_key:
                 continue
+
             m = re.search(re.escape(cand), text)
             ctx = text[max(0, m.start()-80): m.end()+80] if m else ""
             kind = guess_type(cand, ctx)
             fake = generate_fake(cand, kind)
+
             sequel = re.search(SEQUEL_SUFFIX_RE, cand)
             if sequel:
                 base = re.sub(SEQUEL_SUFFIX_RE, '', cand).rstrip()
@@ -215,23 +241,34 @@ def build_mapping_for_folder(in_dir: Path, seed: dict, fuzzy_threshold: float):
                         base_existing = k; break
                 if base_existing:
                     fake = mapping[base_existing] + sequel.group(0)
+
             mapping[cand] = fake
             seen_new[cand] = fake
 
+        print(f"[DEBUG] на данном шаге словарь: {len(mapping):,} пар (+{len(seen_new):,} новых)", file=sys.stderr)
+
+    # алиасы (Имя/Фамилия), если уникальны
     aliases = generate_aliases(mapping)
+    before = len(mapping)
     for k,v in aliases.items():
         mapping.setdefault(k, v)
+    added_aliases = len(mapping) - before
+    print(f"[DEBUG] добавлено алиасов: {added_aliases}", file=sys.stderr)
 
+    # проверка согласованности
     groups = defaultdict(set)
     for k,v in mapping.items():
         groups[base_key(k)].add(v)
-    for bk, vs in groups.items():
-        if len(vs) > 1:
-            print(f"[WARN] Базовая форма {bk!r} мапится в разные значения: {sorted(vs)}", file=sys.stderr)
+    inconsistent = {bk: vs for bk,vs in groups.items() if len(vs) > 1}
+    if inconsistent:
+        print(f"[WARN] найдены неоднозначные базы: {len(inconsistent)}", file=sys.stderr)
+        for bk, vs in list(inconsistent.items())[:10]:
+            print(f"   - {bk!r}: {sorted(vs)}", file=sys.stderr)
 
     return mapping, seen_new
 
-# ---- Замена текста (тот же движок, что и в replace_names.py) ----
+# ---- Замена текста (та же логика, что и в replace_names.py) ----
+
 def prepare_entries(mapping: dict):
     entries = []
     for src, dst in mapping.items():
@@ -263,8 +300,7 @@ def heuristic_inflect(dst_base: str, src_word: str) -> str:
         if low.endswith("ия"): return transfer_caps(src_word, dst_base[:-2]+"ии")
     if case in {"accs"}:
         if low.endswith("а"):  return transfer_caps(src_word, dst_base[:-1]+"у")
-
-    if low.endswith("я"):  return transfer_caps(src_word, dst_base[:-1]+"ю")
+        if low.endswith("я"):  return transfer_caps(src_word, dst_base[:-1]+"ю")
     if case in {"ablt"}:
         if low.endswith("а"):  return transfer_caps(src_word, dst_base[:-1]+"ой")
         if low.endswith("я"):  return transfer_caps(src_word, dst_base[:-1]+"ей")
@@ -351,27 +387,39 @@ def main():
     ap.add_argument("--fuzzy-threshold", type=float, default=0.9, help="Порог похожести для объединения/проверок")
     args = ap.parse_args()
 
+    print(f"[DEBUG] start; cwd={Path.cwd()}", file=sys.stderr)
+    print(f"[DEBUG] args={vars(args)}", file=sys.stderr)
+
     in_dir = Path(args.in_dir)
-    seed = load_seed(args.seed_mapping) if args.seed_mapping else {}
+    print(f"[DEBUG] in-dir resolved: {in_dir.resolve()}", file=sys.stderr)
 
+    seed = load_seed_mapping(args.seed_mapping) if args.seed_mapping else {}
+    print(f"[DEBUG] seed pairs: {len(seed)}", file=sys.stderr)
+
+    print("[DEBUG] строю объединённый словарь…", file=sys.stderr)
+    tA = time.time()
     mapping, new_pairs = build_mapping_for_folder(in_dir, seed, args.fuzzy_threshold)
+    print(f"[DEBUG] словарь собран за {time.time()-tA:.2f}s: всего {len(mapping):,} пар; новых {len(new_pairs):,}", file=sys.stderr)
 
+    print(f"[DEBUG] запись словарей → {args.out_mapping} ; diff → {args.out_diff}", file=sys.stderr)
+    Path(args.out_mapping).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out_mapping).write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
     Path(args.out_diff).write_text(json.dumps(new_pairs, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"✓ mapping → {args.out_mapping}")
-    print(f"✓ new pairs → {args.out_diff}")
 
     if args.replace_out_dir:
         out_dir = Path(args.replace_out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        for p in sorted(in_dir.glob("*.txt")):
+        print(f"[DEBUG] начинаю замену во всех файлах → {out_dir}", file=sys.stderr)
+        tR = time.time()
+        files = sorted(in_dir.glob("*.txt"))
+        for idx, p in enumerate(files, 1):
             txt = p.read_text(encoding="utf-8", errors="ignore")
+            print(f"[DEBUG] [{idx}/{len(files)}] заменяю: {p.name} (len={len(txt):,})", file=sys.stderr)
             replaced = replace_text(txt, mapping)
             (out_dir / p.name).write_text(replaced, encoding="utf-8")
-        print(f"✓ replaced files → {out_dir}")
+        print(f"[DEBUG] замена завершена за {time.time()-tR:.2f}s", file=sys.stderr)
 
-def load_seed(path_str: str):
-    return load_seed_mapping(path_str)
+    print("[OK] done.", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
