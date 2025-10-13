@@ -354,3 +354,24 @@ def main():
     in_dir = Path(args.in_dir)
     seed = load_seed(args.seed_mapping) if args.seed_mapping else {}
 
+    mapping, new_pairs = build_mapping_for_folder(in_dir, seed, args.fuzzy_threshold)
+
+    Path(args.out_mapping).write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    Path(args.out_diff).write_text(json.dumps(new_pairs, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"✓ mapping → {args.out_mapping}")
+    print(f"✓ new pairs → {args.out_diff}")
+
+    if args.replace_out_dir:
+        out_dir = Path(args.replace_out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for p in sorted(in_dir.glob("*.txt")):
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+            replaced = replace_text(txt, mapping)
+            (out_dir / p.name).write_text(replaced, encoding="utf-8")
+        print(f"✓ replaced files → {out_dir}")
+
+def load_seed(path_str: str):
+    return load_seed_mapping(path_str)
+
+if __name__ == "__main__":
+    main()
