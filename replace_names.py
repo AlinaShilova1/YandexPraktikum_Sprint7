@@ -267,8 +267,7 @@ def heuristic_inflect(dst_base: str, src_word: str) -> str:
     return transfer_caps(src_word, dst_base)
 
 def inflect_like(source: str, target_base: str) -> str:
-
-p_src = morph.parse(source)[0]
+    p_src = morph.parse(source)[0]
     p_tgt = morph.parse(target_base)[0]
     need = set()
     if p_src.tag.case:   need.add(p_src.tag.case)
@@ -370,3 +369,4 @@ def main():
 
 if name == "main":
     main()
+
