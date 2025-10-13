@@ -389,7 +389,8 @@ def main():
             (out_dir / p.name).write_text(replaced, encoding="utf-8")
         print(f"✓ replaced files → {out_dir}")
 
-if name == "main":
+if __name__ == "__main__":
     main()
+
 
 
