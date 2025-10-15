@@ -227,10 +227,12 @@ def _has_verb(token: str) -> bool:
 def _is_proper_single_ru(token: str) -> bool:
     p = morph.parse(token)[0]
     tag = p.tag
-    # Имя/Фамилия/Отчество/Топоним/Орг/Аббревиатура — считаем годным
-    if {"Name","Surn","Patr","Geox","Orgn","Abbr"} & set(tag): 
+    # граммемы у тега:
+    grammemes = getattr(tag, "grammemes", set())
+    # признак «именного собственного»:
+    if any(g in grammemes or g in tag for g in ("Name", "Surn", "Patr", "Geox", "Orgn", "Abbr")):
         return True
-    # Существительное (не стоп-слово) — тоже ок
+    # обычное существительное, не стоп-слово
     if str(tag.POS) == "NOUN" and token.lower() not in RU_STOP:
         return True
     return False
@@ -606,3 +608,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
