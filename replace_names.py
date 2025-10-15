@@ -569,3 +569,40 @@ def main():
     ap.add_argument("--replace-out-dir", default=None, help="Куда класть заменённые файлы (если указано)")
     ap.add_argument("--fuzzy-threshold", type=float, default=0.9, help="Порог похожести для объединения/проверок")
     args = ap.parse_args()
+
+    print(f"[DEBUG] start; cwd={Path.cwd()}", file=sys.stderr)
+    print(f"[DEBUG] args={vars(args)}", file=sys.stderr)
+
+    in_dir = Path(args.in_dir)
+    print(f"[DEBUG] in-dir resolved: {in_dir.resolve()}", file=sys.stderr)
+
+    seed = load_seed_mapping(args.seed_mapping) if args.seed_mapping else {}
+    print(f"[DEBUG] seed pairs: {len(seed)}", file=sys.stderr)
+
+    print("[DEBUG] строю объединённый словарь…", file=sys.stderr)
+    tA = time.time()
+    mapping, new_pairs = build_mapping_for_folder(in_dir, seed, args.fuzzy_threshold)
+    print(f"[DEBUG] словарь собран за {time.time()-tA:.2f}s: всего {len(mapping):,} пар; новых {len(new_pairs):,}", file=sys.stderr)
+
+    print(f"[DEBUG] запись словарей → {args.out_mapping} ; diff → {args.out_diff}", file=sys.stderr)
+    Path(args.out_mapping).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out_mapping).write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    Path(args.out_diff).write_text(json.dumps(new_pairs, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if args.replace_out_dir:
+        out_dir = Path(args.replace_out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[DEBUG] начинаю замену во всех файлах → {out_dir}", file=sys.stderr)
+        tR = time.time()
+        files = sorted(in_dir.glob("*.txt"))
+        for idx, p in enumerate(files, 1):
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+            print(f"[DEBUG] [{idx}/{len(files)}] заменяю: {p.name} (len={len(txt):,})", file=sys.stderr)
+            replaced = replace_text(txt, mapping)
+            (out_dir / p.name).write_text(replaced, encoding="utf-8")
+        print(f"[DEBUG] замена завершена за {time.time()-tR:.2f}s", file=sys.stderr)
+
+    print("[OK] done.", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()
