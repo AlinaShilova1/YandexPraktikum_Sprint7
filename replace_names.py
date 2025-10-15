@@ -54,7 +54,7 @@ def is_word(tok: str) -> bool: return bool(re.match(r'^[A-Za-zА-Яа-яЁё0-9]
 def is_space(tok: str) -> bool: return tok.isspace()
 def is_hyphen(tok: str) -> bool: return tok in ('-','–','—')
 
-# ---- лемматизация с кэшем (сильно ускоряет) ----
+# ---- лемматизация с кэшем (ускоряет ×2–×10) ----
 @lru_cache(maxsize=200000)
 def lemmatize(word: str) -> str:
     return morph.parse(word)[0].normal_form
@@ -70,7 +70,7 @@ def load_seed_mapping(path_str: str):
         return {}
     raw = p.read_text(encoding="utf-8-sig")
     if not raw.strip():
-        print(f"[WARN] seed-mapping пустой: {p}.", file=sys.stderr)
+        print(f"[WARN] seed-мэппинг пустой: {p}.", file=sys.stderr)
         return {}
     cleaned = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
     cleaned = re.sub(r"(?m)^\s*//.*?$", "", cleaned)
@@ -88,7 +88,7 @@ def base_key(s: str) -> str:
     s2 = re.sub(SEQUEL_SUFFIX_RE, '', s2)
     return s2
 
-# --- генерация выдуманных названий (нейтральный стиль) ---
+# ---------------- генерация выдуманных названий (нейтральный стиль) ----------------
 SYL_FIRST = ["Ли","За","Ка","Но","Ри","Та","Се","Эй","Де","Ар","Ви","Ма","Ко","Эл","Исо","Те","Ха","На","Ла","Ша"]
 SYL_MID   = ["ни","ро","ва","кси","лор","ви","тра","мен","нек","вар","мор","кал","сен","вер","дар","ли","нон","хал","сал"]
 SYL_LAST  = ["н","с","р","ль","в","кс","рр","м","рд","т","нн","сс","рт","нд","льд"]
@@ -128,59 +128,102 @@ def generate_fake(name: str, kind: str) -> str:
         "event":  gen_event,
     }.get(kind, gen_place)()
 
-# --- эвристическое определение типа по контексту ---
-CTX_PERSON = [r"\b(мистер|миссис|доктор|агент|капитан|лор[дт])\b"]
-CTX_PLACE  = [r"\b(город|страна|столиц[аы]|тюрьм[ае]|баз[ае]|земл[яеи])\b"]
-CTX_ORG    = [r"\b(организаци|корпораци|агентств|институт|департамент|орден|легион)\w*\b"]
-CTX_TECH   = [r"\b(камень|щит|жезл|перчатка|клинок|доспех|устройств|дрон|молот)\w*\b"]
-CTX_EVENT  = [r"\b(битв|войн|вторжен|противостояни|инцидент|осад)\w*\b"]
+# ---------------- строгий извлекатель кандидатов ----------------
+RU_STOP = {
+    "и","или","но","а","как","во","в","на","к","от","до","по","за","для",
+    "что","чтобы","это","тот","эта","эти","его","ее","их","бы","ли","же",
+    "был","была","были","будет","есть","нет","со","об","из","при","над","под",
+}
+EVENT_PREPS = {"за","в","на","под","при"}  # допускаем в названиях событий
 
-def guess_type(name: str, text_sample: str) -> str:
-    ctx = text_sample.lower()
-    for rx in CTX_PERSON:
-        if re.search(rx, ctx): return "person"
-    for rx in CTX_PLACE:
-        if re.search(rx, ctx):  return "place"
-    for rx in CTX_ORG:
-        if re.search(rx, ctx):  return "org"
-    for rx in CTX_TECH:
-        if re.search(rx, ctx):  return "tech"
-    for rx in CTX_EVENT:
-        if re.search(rx, ctx):  return "event"
-    if len(name.split())==2 and name.split()[0][0].isupper() and name.split()[1][0].isupper():
-        return "person"
-    if any(t in name.lower() for t in ["битва","война","вторжение","инцидент","осада"]):
-        return "event"
-    if any(t in name.lower() for t in ["институт","корпорация","агентство","орден","легион","тюрьма"]):
-        return "org"
-    if any(t in name.lower() for t in ["камень","перчатка","жезл","щит","молот"]):
-        return "tech"
-    return "place"
+TRIGGER_HEADS = (
+    r"(?:Камень|Камни|Перчатка|Скипетр|ЩИТ|Гидра|Квинджет|Вибраниум|Башня|Институт|Рафт|М\.Е\.Ч\.|S\.W\.O\.R\.D\.)"
+)
+EVENT_HEADS = r"(?:Битва|Война|Осада|Вторжение|Противостояние|Инцидент)"
 
-# --- извлечение кандидатов из текста ---
-MARVEL_HINTS = [
-    r"\bЩИТ\b", r"\bГидра\b", r"\bМ\.Е\.Ч\.?\b", r"\bS\.W\.O\.R\.D\.?\b",
-    r"\bКамн(ь|и)\b", r"\bКамень (разума|времени|пространства|реальности|силы|души)\b",
-    r"\bВибраниум\b", r"\bКвинджет\b",
-    r"\bМстител[ьи]\b", r"\bВойна Бесконечности\b", r"\bГражданская война\b", r"\bБитва\b",
-    r"\bAvengers\b", r"\bSokovia\b", r"\bWakanda\b", r"\bAsgard\b", r"\bInfinity\b",
-]
+# Прописные последовательности: 1–4 слова, каждое с заглавной
+CAP_SEQ = re.compile(r"\b([A-ZА-ЯЁ][a-zа-яё]+(?:\s+[A-ZА-ЯЁ][a-zа-яё]+){0,3})\b", re.U)
+# Дефисные имена: Человек-паук, Улисс-Кло (после дефиса допускаем нижний регистр)
+HYPHEN_NAME = re.compile(r"\b([A-ZА-ЯЁ][a-zа-яё]+-[A-Za-zА-Яа-яЁё]{2,})\b", re.U)
+# Акронимы/сокращения
+ACRONYM = re.compile(r"\b(ЩИТ|Гидра|М\.Е\.Ч\.?|S\.W\.O\.R\.D\.?)\b", re.U | re.I)
+# Технологии/объекты (голова с прописной + «хвост» со строчной)
+TECH_OBJ = re.compile(rf"\b({TRIGGER_HEADS}\s+[a-zа-яё\-]{{2,}})\b", re.U | re.I)
+# События: «Битва за Соковию», «Война в Ваканде»
+EVENT_PAT = re.compile(
+    rf"\b({EVENT_HEADS})\s+({'|'.join(EVENT_PREPS)})\s+([A-ZА-ЯЁ][a-zа-яё]+)\b", re.U
+)
+
+def _has_verb(token: str) -> bool:
+    p = morph.parse(token)[0]
+    pos = str(p.tag.POS)
+    return pos in ("VERB", "INFN")
+
+def _bad_inside(name: str) -> bool:
+    if re.search(r"[^\w\s\-–—\.]", name, flags=re.U):
+        return True
+    if len(name) > 40: 
+        return True
+    if len(re.split(r"\s+", name.strip())) > 4:
+        return True
+    return False
+
+def filter_candidate(name: str) -> bool:
+    """Жёсткая фильтрация кандидата, чтобы не тащить предложения целиком."""
+    if _bad_inside(name):
+        return False
+    # акронимы/сокращения — ок
+    if ACRONYM.fullmatch(name):
+        return True
+    # события с предлогом — ок
+    if EVENT_PAT.search(name):
+        return True
+    # обычные ФИО/названия: без глаголов и стоп-слов
+    tokens = [t for t in re.split(r"[\s\-–—]+", name) if t]
+    for t in tokens:
+        if "." in t:   # пропускаем части типа «М.Е.Ч.»
+            continue
+        if t.lower() in RU_STOP:
+            return False
+        if _has_verb(t):
+            return False
+    return True
 
 def extract_candidates(text: str):
-    cands = Counter()
-    # 1) хинты
-    for rx in MARVEL_HINTS:
-        for m in re.finditer(rx, text, flags=re.I | re.U):
-            cands[m.group(0)] += 1
-    # 2) Proper-case последовательности
-    for m in re.finditer(r'\b([A-ZА-ЯЁ][a-zа-яё]+(?:[- ][A-ZА-ЯЁa-zа-яё]+)+)\b', text, flags=re.U):
-        s = m.group(1).strip()
-        cands[s] += 1
-    # 3) одиночные маркеры
-    for m in re.finditer(r'\b(Мстители|ЩИТ|Гидра|Рафт|Асгард|Ваканда|Соковия|Камень|Камни|Вибраниум)\b', text, flags=re.U|re.I):
-        cands[m.group(1)] += 1
-    return [k for k, _ in cands.items() if len(k) >= 2]
+    cands = set()
 
+    # 1) акронимы/сокращения
+    for m in ACRONYM.finditer(text):
+        cands.add(m.group(1))
+
+    # 2) тех/объекты от триггеров
+    for m in TECH_OBJ.finditer(text):
+        cand = m.group(1).strip()
+        if filter_candidate(cand):
+            cands.add(cand)
+
+    # 3) события
+    for m in EVENT_PAT.finditer(text):
+        cand = f"{m.group(1)} {m.group(2)} {m.group(3)}".strip()
+        if filter_candidate(cand):
+            cands.add(cand)
+
+    # 4) Capitalized-последовательности
+    for m in CAP_SEQ.finditer(text):
+        cand = m.group(1).strip()
+        if filter_candidate(cand):
+            cands.add(cand)
+
+    # 5) дефисные имена
+    for m in HYPHEN_NAME.finditer(text):
+        cand = m.group(1).strip()
+        if filter_candidate(cand):
+            cands.add(cand)
+
+    cands = [c for c in cands if len(c) >= 2]
+    return sorted(cands, key=str.lower)
+
+# ---------------- алиасы «Имя»/«Фамилия» (если уникальны) ----------------
 def generate_aliases(mapping: dict):
     first_count, last_count = Counter(), Counter()
     pairs = []
@@ -199,6 +242,7 @@ def generate_aliases(mapping: dict):
             new[l] = dl
     return new
 
+# ---------------- построение словаря по папке ----------------
 def build_mapping_for_folder(in_dir: Path, seed: dict, fuzzy_threshold: float):
     mapping = dict(seed) if seed else {}
     seen_new = {}
@@ -213,12 +257,15 @@ def build_mapping_for_folder(in_dir: Path, seed: dict, fuzzy_threshold: float):
 
         cands = extract_candidates(text)
         print(f"[DEBUG] кандидат(ов) извлечено: {len(cands)}", file=sys.stderr)
+        if len(cands) <= 30:
+            print(f"[DEBUG] кандидаты: {', '.join(cands)}", file=sys.stderr)
 
         for cand in cands:
             bk = base_key(cand)
             found_key = None
             for k in mapping.keys():
-                if base_key(k) == bk: found_key = k; break
+                if base_key(k) == bk: 
+                    found_key = k; break
             if not found_key:
                 sim_hits = [k for k in mapping.keys() if similarity(base_key(k), bk) >= fuzzy_threshold]
                 if sim_hits:
@@ -228,7 +275,17 @@ def build_mapping_for_folder(in_dir: Path, seed: dict, fuzzy_threshold: float):
 
             m = re.search(re.escape(cand), text)
             ctx = text[max(0, m.start()-80): m.end()+80] if m else ""
-            kind = guess_type(cand, ctx)
+            # простая эвристика типа (можно дообучать, но мы сильно сузили кандидатов)
+            kind = "person"
+            if EVENT_PAT.search(cand): kind = "event"
+            elif TECH_OBJ.search(cand): kind = "tech"
+            elif ACRONYM.fullmatch(cand): kind = "org"
+            elif "-" in cand: kind = "person"
+            elif len(cand.split())>=2 and cand.split()[0][0].isupper() and cand.split()[1][0].isupper():
+                kind = "person"
+            else:
+                kind = "place"
+
             fake = generate_fake(cand, kind)
 
             sequel = re.search(SEQUEL_SUFFIX_RE, cand)
@@ -245,7 +302,7 @@ def build_mapping_for_folder(in_dir: Path, seed: dict, fuzzy_threshold: float):
             mapping[cand] = fake
             seen_new[cand] = fake
 
-        print(f"[DEBUG] на данном шаге словарь: {len(mapping):,} пар (+{len(seen_new):,} новых)", file=sys.stderr)
+        print(f"[DEBUG] словарь на шаге: {len(mapping):,} пар (+{len(seen_new):,} новых)", file=sys.stderr)
 
     # алиасы (Имя/Фамилия), если уникальны
     aliases = generate_aliases(mapping)
@@ -267,8 +324,7 @@ def build_mapping_for_folder(in_dir: Path, seed: dict, fuzzy_threshold: float):
 
     return mapping, seen_new
 
-# ---- Замена текста (та же логика, что и в replace_names.py) ----
-
+# ---------------- замена текста ----------------
 def prepare_entries(mapping: dict):
     entries = []
     for src, dst in mapping.items():
