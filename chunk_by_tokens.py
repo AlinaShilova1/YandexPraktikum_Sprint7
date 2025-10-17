@@ -1,14 +1,16 @@
 from pathlib import Path
-import os, subprocess, hashlib, json
+import os
+import subprocess
+import hashlib
+import json
 from tqdm import tqdm
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import pandas as pd
 
-IN_DIR = Path("./knowledge_base")   
+IN_DIR = Path("./knowledge_base")
 OUT_JSONL = Path("./chunks/chunks.jsonl")
-OUT_CSV   = Path("./chunks/chunks.csv")
+OUT_CSV = Path("./chunks/chunks.csv")
 
-# --- Вычисляем корень репозитория (или используем CWD) ---
 def get_repo_root() -> Path:
     try:
         out = subprocess.check_output(
@@ -21,18 +23,17 @@ def get_repo_root() -> Path:
 
 REPO_ROOT = get_repo_root()
 
-# --- Сплиттер по токенам (OpenAI cl100k_base) ---
 splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
     chunk_size=800,
     chunk_overlap=200,
     encoding_name="cl100k_base",
     separators=["\n\n", "\n", " ", ""],
+    add_start_index=True,
 )
 
 def stable_id(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-# Гарантируем, что выходная папка есть
 OUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
 
 rows = []
@@ -40,24 +41,20 @@ with OUT_JSONL.open("w", encoding="utf-8") as fjsonl:
     for path in tqdm(sorted(IN_DIR.glob("*.txt"))):
         text = path.read_text(encoding="utf-8", errors="ignore")
         doc_id = stable_id(str(path.resolve()))
-
-        # Относительный путь к корню репозитория (красиво для цитирования)
         try:
             source_rel = os.path.relpath(str(path.resolve()), start=str(REPO_ROOT))
         except Exception:
-            # запасной вариант — просто POSIX-путь
             source_rel = path.as_posix()
 
         docs = splitter.create_documents(
             texts=[text],
             metadatas=[{"source": source_rel}],
-            add_start_index=True
         )
 
         for idx, d in enumerate(docs):
             meta = d.metadata or {}
             start = int(meta.get("start_index", 0))
-            end   = start + len(d.page_content)
+            end = start + len(d.page_content)
             rec = {
                 "id": f"{doc_id}:{idx}",
                 "doc_id": doc_id,
