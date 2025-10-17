@@ -187,7 +187,8 @@ def match_phrase(tokens, i, entry):
                 return None
 
         matched.append(j); j += 1
-k = j; tail = ""
+        
+    k = j; tail = ""
     save_k = k
     while k < len(tokens) and is_space(tokens[k]): k += 1
     if k < len(tokens) and is_word(tokens[k]) and re.fullmatch(r'(?:\d+|[IVX]{1,4})', tokens[k]):
@@ -265,3 +266,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
