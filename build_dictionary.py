@@ -302,9 +302,14 @@ def main():
     # собираем финальный словарь
     final_map = {}
     rows = []
-    for lbk, data in sorted(groups.items(), key=lambda kv: sum(data["forms_no_suffix"].values()) + sum(sum(v.values()) for v in data["forms_by_suffix"].values()), reverse=True):
-        base_forms = data["forms_no_suffix"]
-        suffix_forms = data["forms_by_suffix"]
+    for lbk, data in sorted(
+        groups.items(),
+        key=lambda kv: (
+            sum(kv[1]["forms_no_suffix"].values())
+            + sum(sum(v.values()) for v in kv[1]["forms_by_suffix"].values())
+        ),
+        reverse=True
+    ):
 
         # ключ-«база» (если нет форм без суффикса, возьмём самую частую из любых и отрежем суф.)
         if base_forms:
