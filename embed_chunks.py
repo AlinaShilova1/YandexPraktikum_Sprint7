@@ -1,4 +1,4 @@
-from future import annotations
+from __future__ import annotations
 import argparse, os, json, time, math
 from pathlib import Path
 from typing import List, Dict, Any
