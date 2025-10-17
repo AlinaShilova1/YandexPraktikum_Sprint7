@@ -163,7 +163,7 @@ def extract_candidates(text: str) -> Counter:
     for m in CAP_SEQ.finditer(text):
         cand = m.group(1).strip()
         first = cand.split()[0]
-        if first.lower() in RU_STOP or first in EN_STOP:  # «Тогда Танос»
+        if first.lower() in RU_STOP or first in EN_STOP:
             continue
         if filter_candidate(cand): cands[cand] += 1
     for m in HYPHEN_NAME.finditer(text):
@@ -263,7 +263,6 @@ def load_seed_mapping(path: str) -> dict:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
         print(f"[ERROR] Некорректный JSON: {path}", file=sys.stderr); raise
-    # нормализуем ключи seed по лемме для наследования
     return {k.strip(): v.strip() for k, v in data.items() if k.strip()}
 
 # ---------- main ----------
@@ -299,59 +298,67 @@ def main():
             else:
                 groups[lbk]["forms_no_suffix"][cand] += cnt
 
+    # утилита для сортировки по суммарной частоте
+    def total_count_of(data_dict):
+        base_cnt = sum(data_dict.get("forms_no_suffix", {}).values())
+        suf_cnt  = sum(sum(v.values()) for v in data_dict.get("forms_by_suffix", {}).values())
+        return base_cnt + suf_cnt
+
     # собираем финальный словарь
     final_map = {}
     rows = []
-    for lbk, data in sorted(
-        groups.items(),
-        key=lambda kv: (
-            sum(kv[1]["forms_no_suffix"].values())
-            + sum(sum(v.values()) for v in kv[1]["forms_by_suffix"].values())
-        ),
-        reverse=True
-    ):
 
-        # ключ-«база» (если нет форм без суффикса, возьмём самую частую из любых и отрежем суф.)
+    for lbk, data in sorted(groups.items(), key=lambda kv: total_count_of(kv[1]), reverse=True):
+        base_forms   = data.get("forms_no_suffix", Counter())
+        suffix_forms = data.get("forms_by_suffix", defaultdict(Counter))
+
+        # ключ-«база»
         if base_forms:
             best_base_form, _ = base_forms.most_common(1)[0]
         else:
-            # найдём самый частотный среди всех и уберём суффикс визуально
-            best_any_suf = max(((suf, cnts.most_common(1)[0]) for suf, cnts in suffix_forms.items()),
-                               key=lambda x: x[1][1], default=(None, (None, 0)))
-            best_form = best_any_suf[1][0] if best_any_suf[1][0] else None
+            # если базовых нет, берём самую частую форму среди суффиксных и отрезаем суффикс
+            best_form = None
+            best_cnt  = -1
+            for cnts in suffix_forms.values():
+                if cnts:
+                    f, c = cnts.most_common(1)[0]
+                    if c > best_cnt:
+                        best_form, best_cnt = f, c
             best_base_form = split_base_suffix(best_form)[0] if best_form else lbk
 
         base_key = canonical_src(best_base_form)
-        english = all(is_english_string(t) or is_dotted_acronym(t) for t in re.split(r'[\s\-–—]+', base_key) if t)
-
-        # определить тип по базе
+        english = all(
+            (is_english_string(t) or is_dotted_acronym(t))
+            for t in re.split(r'[\s\-–—]+', base_key) if t
+        )
         kind = guess_kind(best_base_form)
 
-        # взять из seed, если есть; иначе сгенерировать
+        # унаследовать из seed по лемме базы (если есть), иначе сгенерировать
         fake_base = seed_by_lemma.get(lemma_key(base_key))
         if not fake_base:
             fake_base = generate_fake(kind, english)
 
-        # записать базу
+        # база
         final_map[base_key] = fake_base
 
-        # записать все сиквелы (если есть)
+        # сиквелы
         for suf, cnts in suffix_forms.items():
+            if not cnts:
+                continue
             best_form_suf, _ = cnts.most_common(1)[0]
             key_with_suf = canonical_src(best_form_suf)  # уже содержит суффикс
             final_map[key_with_suf] = fake_base + suf
 
         # статистика
-        total_count = sum(base_forms.values()) + sum(sum(v.values()) for v in suffix_forms.values())
         raw_forms = []
-        raw_forms += [f"{f}×{c}" for f,c in base_forms.most_common()]
+        raw_forms += [f"{f}×{c}" for f, c in base_forms.most_common()]
         for suf, cnts in suffix_forms.items():
-            raw_forms += [f"{f}×{c}" for f,c in cnts.most_common()]
+            raw_forms += [f"{f}×{c}" for f, c in cnts.most_common()]
         rows.append({
             "lemma_key": lbk,
             "chosen_base": base_key,
             "fake_base": fake_base,
-            "total_count": total_count,
+            "total_count": total_count_of(data),
             "raw_forms": "; ".join(raw_forms)
         })
 
