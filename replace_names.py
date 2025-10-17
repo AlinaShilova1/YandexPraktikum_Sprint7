@@ -44,22 +44,60 @@ def is_space(tok: str):  return tok.isspace()
 def is_hyphen(tok: str): return tok in ('-','–','—')
 def is_english_string(s: str) -> bool: return bool(LATIN_RE.fullmatch(s.strip()))
 
+def _yo2e(s: str) -> str:
+    # нормализуем Ё/ё → Е/е для устойчивого матчинга
+    return s.replace("Ё","Е").replace("ё","е")
+
 @lru_cache(maxsize=200000)
 def lemma(w: str) -> str:
-    w = w.lower()
+    w = _yo2e(w.lower())
     try:
-        return morph.parse(w)[0].normal_form
+        return _yo2e(morph.parse(w)[0].normal_form)
     except Exception:
         return w
 
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8-sig")
+
+def _strip_comments(s: str) -> str:
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+    s = re.sub(r"(?m)^\s*//.*?$", "", s)
+    return s
+
 def load_mapping(path: Path) -> dict:
-    raw = path.read_text(encoding="utf-8-sig")
-    cleaned = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
-    cleaned = re.sub(r"(?m)^\s*//.*?$", "", cleaned)
-    data = json.loads(cleaned)
-    return {k.strip(): v.strip() for k, v in data.items() if k.strip() and v.strip()}
+    raw = _read_text(path)
+    cleaned = _strip_comments(raw)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        import json5
+        data = json5.loads(raw)
+    # только непустые пары
+    data = {k.strip(): v.strip() for k, v in data.items() if k and v and k.strip() and v.strip()}
+    return data
+
+def expand_person_aliases(mapping: dict, enable: bool = True) -> dict:
+    """Если есть 'Имя Фамилия' → 'Имя2 Фамилия2', добавляем Имя→Имя2, Фамилия→Фамилия2.
+       Не затираем уже заданные пользователем пары."""
+    if not enable: return mapping
+    extra = {}
+    for src, dst in list(mapping.items()):
+        s_parts = re.split(r'[ \-–—]+', src.strip())
+        d_parts = re.split(r'[ \-–—]+', dst.strip())
+        if len(s_parts) == 2 and len(d_parts) == 2:
+            s_first, s_last = s_parts
+            d_first, d_last = d_parts
+            # добавляем только если нет в словаре
+            extra.setdefault(s_first, d_first)
+            extra.setdefault(s_last, d_last)
+    # не перезаписываем существующие ключи
+    for k, v in extra.items():
+        if k not in mapping:
+            mapping[k] = v
+    return mapping
 
 def prepare_entries(mapping: dict):
+    """Готовим записи для сопоставления по леммам (рус) или по нижнему регистру (англ)."""
     entries = []
     for src, dst in mapping.items():
         sequel = re.search(SEQUEL_SUFFIX_RE, src)
@@ -68,6 +106,7 @@ def prepare_entries(mapping: dict):
 
         src_tokens = re.split(r'[ \-–—]+', src_clean)
         dst_tokens = re.split(r'[ \-–—]+', dst_base)
+        # ключи для матчинга: EN → lower, RU → lemma(lower), всё с нормализацией ё→е
         src_keys   = [t.lower() if is_english_string(t) else lemma(t) for t in src_tokens]
 
         entries.append({
@@ -75,6 +114,7 @@ def prepare_entries(mapping: dict):
             "src_tokens": src_tokens, "dst_tokens": dst_tokens,
             "src_keys": src_keys, "sequel_src": sequel.group(0) if sequel else ""
         })
+    # длинные фразы вперёд, чтобы не перебивать короткими
     entries.sort(key=lambda e: len(e["src_tokens"]), reverse=True)
     return entries
 
@@ -84,10 +124,11 @@ def transfer_caps(src_word: str, dst_word: str) -> str:
     return dst_word
 
 def heuristic_inflect(dst_base: str, src_word: str) -> str:
-    if is_english_string(dst_base):  # англ. — без склонения
+    # англ. не склоняем
+    if is_english_string(dst_base):
         return transfer_caps(src_word, dst_base)
-    low = dst_base.lower()
-    p = morph.parse(src_word)[0]
+    low = _yo2e(dst_base.lower())
+    p = morph.parse(_yo2e(src_word))[0]
     case = getattr(p.tag, "case", None)
     if case in {"gent"}:
         if low.endswith("а"):  return transfer_caps(src_word, dst_base[:-1]+"ы")
@@ -113,8 +154,8 @@ def heuristic_inflect(dst_base: str, src_word: str) -> str:
 def inflect_like(src_word: str, dst_base: str) -> str:
     if is_english_string(dst_base):
         return transfer_caps(src_word, dst_base)
-    p_src = morph.parse(src_word)[0]
-    p_tgt = morph.parse(dst_base)[0]
+    p_src = morph.parse(_yo2e(src_word))[0]
+    p_tgt = morph.parse(_yo2e(dst_base))[0]
     need = set()
     if getattr(p_src.tag, "case", None):   need.add(p_src.tag.case)
     if getattr(p_src.tag, "number", None): need.add(p_src.tag.number)
@@ -133,7 +174,8 @@ def match_phrase(tokens, i, entry):
         while j < len(tokens) and (is_space(tokens[j]) or is_hyphen(tokens[j])): j += 1
         if j >= len(tokens) or not is_word(tokens[j]): return None
         cur = tokens[j]
-        cur_key = cur.lower() if is_english_string(cur) else lemma(cur.lower())
+        # нормализуем ё→е перед лемматизацией
+        cur_key = _yo2e(cur.lower()) if is_english_string(cur) else lemma(cur.lower())
         if cur_key != need: return None
         matched.append(j); j += 1
     k = j; tail = ""
@@ -149,6 +191,7 @@ def apply_replacement(tokens, pos_list, entry, tail):
     for idx, dst_base in enumerate(dst_tokens):
         src_idx = pos_list[min(idx, len(pos_list)-1)]
         out_words.append(inflect_like(tokens[src_idx], dst_base))
+    # сохранить оригинальные разделители
     seps = []
     for a,b in zip(pos_list, pos_list[1:]): seps.append("".join(tokens[a+1:b]))
     rebuilt = []
@@ -161,10 +204,10 @@ def apply_replacement(tokens, pos_list, entry, tail):
     tokens[first] = "".join(rebuilt)
     for t in range(first+1, last+1): tokens[t] = ""
 
-def replace_text(text: str, mapping: dict) -> str:
+def replace_text(text: str, mapping: dict) -> tuple[str, int]:
     entries = prepare_entries(mapping)
     tokens = tokenize(text); i = 0
-
+    replacements = 0
     while i < len(tokens):
         if not is_word(tokens[i]): i += 1; continue
         matched = None
@@ -175,32 +218,43 @@ def replace_text(text: str, mapping: dict) -> str:
             i += 1; continue
         entry, positions, j, k, tail = matched
         apply_replacement(tokens, positions, entry, tail)
+        replacements += 1
         i = k
-    return "".join(tokens)
+    return "".join(tokens), replacements
 
 def main():
     ap = argparse.ArgumentParser(description="Пакетная замена по готовому словарю (RU-склонения, EN — без склонения).")
     ap.add_argument("--in-dir", required=True, help="Папка с исходными .txt")
     ap.add_argument("--mapping", required=True, help="Готовый terms_map.json (ключ→значение)")
     ap.add_argument("--out-dir", required=True, help="Куда сохранить заменённые файлы")
+    ap.add_argument("--no-aliases", action="store_true", help="Не добавлять авто-алиасы Имя/Фамилия")
     args = ap.parse_args()
 
     in_dir = Path(args.in_dir)
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+
     mapping = load_mapping(Path(args.mapping))
     if not mapping:
         print("[ERROR] В словаре нет ни одной пары с непустым значением.", file=sys.stderr); sys.exit(1)
+
+    # автодобавление алиасов Имя/Фамилия (в т.ч. для «Старка/Старком»)
+    if not args.no_aliases:
+        mapping = expand_person_aliases(mapping, enable=True)
 
     files = sorted(in_dir.glob("*.txt"))
     if not files:
         print(f"[WARN] В {in_dir} нет .txt файлов", file=sys.stderr)
 
+    total_repl = 0
     print(f"[INFO] пар в словаре: {len(mapping)}; файлов: {len(files)}")
     for idx, p in enumerate(files, 1):
         txt = p.read_text(encoding="utf-8", errors="ignore")
-        res = replace_text(txt, mapping)
+        res, cnt = replace_text(txt, mapping)
         (out_dir / p.name).write_text(res, encoding="utf-8")
-        print(f"[OK] [{idx}/{len(files)}] → {out_dir/p.name}")
+        total_repl += cnt
+        print(f"[OK] [{idx}/{len(files)}] → {out_dir/p.name} (замен: {cnt})")
+
+    print(f"[DONE] Всего замен: {total_repl}")
 
 if __name__ == "__main__":
     main()
