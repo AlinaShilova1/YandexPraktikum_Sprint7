@@ -1,0 +1,8 @@
+{
+  "dim": 768,
+  "metric": "cosine",
+  "source_embeddings_file": "vectors/embeddings.jsonl",
+  "index_file": "index/faiss.index",
+  "meta_file": "index/meta.jsonl",
+  "count": 697
+}
