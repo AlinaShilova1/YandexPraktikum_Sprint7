@@ -30,14 +30,10 @@ def embed_query(text: str, model: SentenceTransformer, metric: str) -> np.ndarra
         vec = l2_normalize(vec)
     return vec
 
-def retrieve(index, metas, qvec: np.ndarray, topk: int) -> List[Tuple[int, float, Dict]]:
-    D, I = index.search(qvec, topk)
-    out = []
-    for dist, idx in zip(D[0], I[0]):
-        if idx < 0:
-            continue
-        out.append((int(idx), float(dist), metas[int(idx)]))
-    return out
+def retrieve(index, metas, qvec: np.ndarray, topk: int) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
+    D, I = index.search(qvec, topk)  # D: (1, topk) similarities (IP/cosine), I: indices
+    hits = [metas[int(idx)] for idx in I[0] if idx >= 0]
+    return D[0], I[0], hits
 
 # ---------------- Prompt building ----------------
 BASE_FEW_SHOTS = [
@@ -49,14 +45,15 @@ BASE_FEW_SHOTS = [
 
 SYSTEM_PROMPT = (
     "Ты русскоязычный помощник по базе знаний. Сначала размышляй шаг за шагом, "
-    "но не раскрывай внутренние рассуждения пользователю. В ответе верни только: "
-    "1) краткий ответ; 2) два пункта пояснений; 3) источники с позициями. "
-    "Опирайся исключительно на предоставленные фрагменты контекста."
+    "но не раскрывай внутренние рассуждения пользователю. "
+    "Строго опирайся на предоставленные фрагменты контекста; если информации "
+    "недостаточно для ответа, честно напиши: «Я не знаю» и ничего не выдумывай. "
+    "Формат ответа: 1) краткий ответ; 2) два пункта пояснений; 3) источники с позициями."
 )
 
-def format_context(hits: List[Tuple[int, float, Dict]], max_chars_per_chunk: int) -> str:
+def format_context(hits_pack: List[Tuple[int, float, Dict]], max_chars_per_chunk: int) -> str:
     blocks = []
-    for rank, (_, score, m) in enumerate(hits, start=1):
+    for rank, (_, score, m) in enumerate(hits_pack, start=1):
         txt = (m.get("text") or "").strip()
         if len(txt) > max_chars_per_chunk:
             txt = txt[:max_chars_per_chunk] + "…"
@@ -80,13 +77,13 @@ def build_messages(query: str, context_blocks: str, shots_pairs: int) -> List[Di
     )
     return [{"role": "system", "content": SYSTEM_PROMPT}] + shots + [{"role": "user", "content": task}]
 
-# ---------------- LLM ----------------
+# ---------------- LLM (llama.cpp) ----------------
 class LlamaBackend:
-    def __init__(self, model_path: str, chat_format: str = "qwen", n_ctx: int = 4096, n_threads: int = 4):
+    def __init__(self, model_path: str, chat_format: str, n_ctx: int, n_threads: int):
         from llama_cpp import Llama
         self.llm = Llama(
             model_path=model_path,
-            chat_format=chat_format,
+            chat_format=chat_format,  # напр. "qwen" для Qwen-инструкт моделей
             n_ctx=n_ctx,
             n_threads=n_threads,
             verbose=False
@@ -113,25 +110,63 @@ class LlamaBackend:
         )
         return out["choices"][0]["message"]["content"].strip()
 
+# ---------------- Budgeting ----------------
+def build_messages_with_budget(
+    backend: LlamaBackend,
+    query: str,
+    hits_pack: List[Tuple[int, float, Dict]],
+    shots_pairs: int,
+    ctx_window: int,
+    max_output_tokens: int,
+    init_chunk_chars: int,
+) -> List[Dict[str, str]]:
+    reserve = 64
+    chunk_chars = init_chunk_chars
+    use_hits = hits_pack[:]
+    while True:
+        ctx_text = format_context(use_hits, max_chars_per_chunk=chunk_chars)
+        messages = build_messages(query, ctx_text, shots_pairs=shots_pairs)
+        used = backend.messages_token_len(messages)
+        budget = ctx_window - max_output_tokens - reserve
+        if used <= budget:
+            return messages
+        if chunk_chars > 200:
+            chunk_chars = int(chunk_chars * 0.75)
+        elif len(use_hits) > 1:
+            use_hits = use_hits[:-1]
+            chunk_chars = max(init_chunk_chars, chunk_chars)
+        else:
+            if shots_pairs > 0:
+                shots_pairs -= 1
+            elif max_output_tokens > 256:
+                max_output_tokens = 256
+            else:
+                return messages
+
 # ---------------- REPL ----------------
 def main():
-    ap = argparse.ArgumentParser(description="RAG REPL (FAISS + llama.cpp)")
-    ap.add_argument("--model-path", required=True, help="Путь к GGUF-модели")
-    ap.add_argument("--chat-format", default="qwen")
+    ap = argparse.ArgumentParser(description="RAG REPL over FAISS index (llama.cpp, no OpenAI), with abstention")
     ap.add_argument("--index", default="./index/faiss.index")
     ap.add_argument("--meta", default="./index/meta.jsonl")
     ap.add_argument("--info", default="./index/info.json")
     ap.add_argument("--emb-model", default="intfloat/multilingual-e5-base")
+    ap.add_argument("--model-path", required=True, help="Путь к GGUF-модели")
+    ap.add_argument("--chat-format", default="qwen", help="chat_format для llama.cpp (qwen, llama-2, mistral)")
     ap.add_argument("--topk", type=int, default=5)
-    ap.add_argument("--shots", type=int, default=1)
-    ap.add_argument("--ctx", type=int, default=4096)
-    ap.add_argument("--max-out", type=int, default=512)
-    ap.add_argument("--chunk-chars", type=int, default=900)
+    ap.add_argument("--shots", type=int, default=1, help="Количество пар few-shot (0..2)")
+    ap.add_argument("--ctx", type=int, default=4096, help="Окно контекста для LLM")
+    ap.add_argument("--max-out", type=int, default=512, help="Максимум токенов в ответе")
+    ap.add_argument("--chunk-chars", type=int, default=900, help="Макс. символов на чанк в контексте")
+    ap.add_argument("--sim-threshold", type=float, default=0.30, help="Минимальная схожесть (cosine/IP) для приёма хита")
+    ap.add_argument("--min-hits", type=int, default=1, help="Минимум уверенных хитов")
+    ap.add_argument("--debug", action="store_true", help="Печатать отладочную инфу (оценки схожести)")
     args = ap.parse_args()
 
     model_path = Path(args.model_path).expanduser().resolve()
     if not model_path.exists():
-        raise FileNotFoundError(f"GGUF-модель не найдена: {model_path}")
+        parent = model_path.parent
+        listing = "\n".join([p.name for p in parent.glob('*.gguf')]) if parent.exists() else "(каталог не найден)"
+        raise FileNotFoundError(f"GGUF-модель не найдена: {model_path}\nВ каталоге:\n{listing}")
 
     index, info, metas = load_index(Path(args.index), Path(args.info), Path(args.meta))
     metric = info.get("metric", "cosine")
@@ -139,9 +174,15 @@ def main():
 
     emb_model = SentenceTransformer(args.emb_model, device="cpu")
 
+    from llama_cpp import Llama  # noqa: F401
     n_threads = max(2, (os.cpu_count() or 4) // 2)
-    backend = LlamaBackend(model_path=str(model_path), chat_format=args.chat_format, n_ctx=args.ctx, n_threads=n_threads)
-    print(f"[LLM] llama.cpp backend; ctx={args.ctx}; threads={n_threads}; model={model_path.name}")
+    backend = LlamaBackend(
+        model_path=str(model_path),
+        chat_format=args.chat_format,
+        n_ctx=args.ctx,
+        n_threads=n_threads
+    )
+    print(f"[LLM] llama.cpp; ctx={args.ctx}; threads={n_threads}; chat_format={args.chat_format}; model={model_path.name}")
 
     while True:
         try:
@@ -150,15 +191,41 @@ def main():
             break
         if not q or q == "/q":
             break
-
         qvec = embed_query(q, emb_model, metric)
-        hits = retrieve(index, metas, qvec.astype("float32"), topk=args.topk)
-        if not hits:
-            print("⛔ Ничего не найдено.")
+        D, I, raw_hits = retrieve(index, metas, qvec.astype("float32"), topk=args.topk)
+
+        # соединим оценки с метаданными
+        hits_pack = []
+        for dist, idx, meta in zip(D, I, raw_hits):
+            if idx < 0:
+                continue
+            hits_pack.append((int(idx), float(dist), meta))
+
+        if args.debug:
+            print("[DEBUG] top scores:", ", ".join(f"{s:.3f}" for s in D if s == s))  # skip NaN
+
+        # фильтр по порогу схожести
+        confident = [(i, s, m) for (i, s, m) in hits_pack if s >= args.sim_threshold]
+
+        if len(confident) < args.min_hits:
+            # честный отказ — не зовём LLM
+            print("\n" + "=" * 80)
+            print("Ответ: Я не знаю.")
+            print("Объяснение:\n  • В базе знаний не найдено достаточно релевантных фрагментов.\n  • Я не буду придумывать ответ без источников.")
+            print("Источники:\n  • —")
+            print("=" * 80)
             continue
 
-        ctx_text = format_context(hits, max_chars_per_chunk=args.chunk_chars)
-        messages = build_messages(q, ctx_text, shots_pairs=args.shots)
+        # строим сообщения с учётом бюджета токенов
+        messages = build_messages_with_budget(
+            backend=backend,
+            query=q,
+            hits_pack=confident,
+            shots_pairs=max(0, min(args.shots, 2)),
+            ctx_window=args.ctx,
+            max_output_tokens=args.max_out,
+            init_chunk_chars=max(200, args.chunk_chars),
+        )
 
         try:
             answer = backend.generate(messages, max_tokens=args.max_out)
