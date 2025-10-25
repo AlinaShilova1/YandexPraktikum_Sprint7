@@ -82,7 +82,7 @@ def build_messages(query: str, context_blocks: str, shots_pairs: int) -> List[Di
 
 # ---------------- LLM ----------------
 class LlamaBackend:
-    def init(self, model_path: str, chat_format: str = "qwen", n_ctx: int = 4096, n_threads: int = 4):
+    def __init__(self, model_path: str, chat_format: str = "qwen", n_ctx: int = 4096, n_threads: int = 4):
         from llama_cpp import Llama
         self.llm = Llama(
             model_path=model_path,
