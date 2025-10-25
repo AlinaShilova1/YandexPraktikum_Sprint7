@@ -41,10 +41,10 @@ def retrieve(index, metas, qvec: np.ndarray, topk: int) -> List[Tuple[int, float
 
 # ---------------- Prompt building ----------------
 BASE_FEW_SHOTS = [
-    {"role": "user", "content": "Каким оружием обладает Мин?"},
-    {"role": "assistant", "content": "Оружие Мина называется Нохалбур"},
-    {"role": "user", "content": "В какой стране родилась Эйменория?"},
-    {"role": "assistant", "content": "Эйменория родиом из Элвастана"},
+    {"role": "user", "content": "Как называется столица планеты Ти’лора?"},
+    {"role": "assistant", "content": "Столица планеты Ти’лора называется Сайрон."},
+    {"role": "user", "content": "Какая энергия питает узел HyperRelay?"},
+    {"role": "assistant", "content": "Согласно документу, HyperRelay питается от ядра VoidCore."},
 ]
 
 SYSTEM_PROMPT = (
@@ -80,9 +80,9 @@ def build_messages(query: str, context_blocks: str, shots_pairs: int) -> List[Di
     )
     return [{"role": "system", "content": SYSTEM_PROMPT}] + shots + [{"role": "user", "content": task}]
 
-# ---------------- LLM (llama.cpp) ----------------
+# ---------------- LLM ----------------
 class LlamaBackend:
-    def init(self, model_path: str, chat_format: str, n_ctx: int, n_threads: int):
+    def init(self, model_path: str, chat_format: str = "qwen", n_ctx: int = 4096, n_threads: int = 4):
         from llama_cpp import Llama
         self.llm = Llama(
             model_path=model_path,
@@ -113,65 +113,25 @@ class LlamaBackend:
         )
         return out["choices"][0]["message"]["content"].strip()
 
-# ---------------- Budgeting ----------------
-def build_messages_with_budget(
-    backend: LlamaBackend,
-    query: str,
-    hits: List[Tuple[int, float, Dict]],
-    shots_pairs: int,
-    ctx_window: int,
-    max_output_tokens: int,
-    init_chunk_chars: int,
-) -> List[Dict[str, str]]:
-    reserve = 64
-    chunk_chars = init_chunk_chars
-    use_hits = hits[:]
-    while True:
-        ctx_text = format_context(use_hits, max_chars_per_chunk=chunk_chars)
-        messages = build_messages(query, ctx_text, shots_pairs=shots_pairs)
-        used = backend.messages_token_len(messages)
-        budget = ctx_window - max_output_tokens - reserve
-        if used <= budget:
-            return messages
-        if chunk_chars > 200:
-            chunk_chars = int(chunk_chars * 0.75)
-        elif len(use_hits) > 1:
-            use_hits = use_hits[:-1]
-            chunk_chars = max(init_chunk_chars, chunk_chars)
-        else:
-            if shots_pairs > 0:
-                shots_pairs -= 1
-            elif max_output_tokens > 256:
-                max_output_tokens = 256
-            else:
-                return messages
-
 # ---------------- REPL ----------------
 def main():
-    ap = argparse.ArgumentParser(description="RAG REPL over FAISS index (llama.cpp only)")
+    ap = argparse.ArgumentParser(description="RAG REPL (FAISS + llama.cpp)")
+    ap.add_argument("--model-path", required=True, help="Путь к GGUF-модели")
+    ap.add_argument("--chat-format", default="qwen")
     ap.add_argument("--index", default="./index/faiss.index")
     ap.add_argument("--meta", default="./index/meta.jsonl")
     ap.add_argument("--info", default="./index/info.json")
     ap.add_argument("--emb-model", default="intfloat/multilingual-e5-base")
     ap.add_argument("--topk", type=int, default=5)
-    ap.add_argument("--shots", type=int, default=1, help="Количество пар few-shot (0..2)")
-    ap.add_argument("--ctx", type=int, default=4096, help="Окно контекста для LLM")
-    ap.add_argument("--max-out", type=int, default=512, help="Максимум токенов в ответе")
-    ap.add_argument("--chunk-chars", type=int, default=900, help="Макс. символов на чанк в контексте")
-    ap.add_argument("--model-path", required=True, help="Путь к GGUF-модели")
-    ap.add_argument("--chat-format", default="qwen", help="chat_format для llama.cpp (например, qwen, llama-2, mistral)")
+    ap.add_argument("--shots", type=int, default=1)
+    ap.add_argument("--ctx", type=int, default=4096)
+    ap.add_argument("--max-out", type=int, default=512)
+    ap.add_argument("--chunk-chars", type=int, default=900)
     args = ap.parse_args()
 
-    # проверка пути к модели
-    model_path = Path(os.path.expanduser(os.path.expandvars(args.model_path))).resolve()
+    model_path = Path(args.model_path).expanduser().resolve()
     if not model_path.exists():
-        # диагностика для удобства
-        parent = model_path.parent
-        listing = "\n".join([p.name for p in parent.glob("*.gguf")]) if parent.exists() else "(нет каталога)"
-        raise FileNotFoundError(
-            f"GGUF-модель не найдена по пути:\n  {model_path}\n"
-            f"Каталог: {parent}\nСодержимое *.gguf:\n{listing}"
-        )
+        raise FileNotFoundError(f"GGUF-модель не найдена: {model_path}")
 
     index, info, metas = load_index(Path(args.index), Path(args.info), Path(args.meta))
     metric = info.get("metric", "cosine")
@@ -179,16 +139,9 @@ def main():
 
     emb_model = SentenceTransformer(args.emb_model, device="cpu")
 
-    from llama_cpp import Llama  # проверка наличия пакета
     n_threads = max(2, (os.cpu_count() or 4) // 2)
-    backend = LlamaBackend(
-        model_path=str(model_path),
-        chat_format=args.chat_format,
-        n_ctx=args.ctx,
-        n_threads=n_threads
-    )
-    print(f"[LLM] llama.cpp backend; ctx={args.ctx}; threads={n_threads}; chat_format={args.chat_format}")
-    print(f"[MODEL] {model_path}")
+    backend = LlamaBackend(model_path=str(model_path), chat_format=args.chat_format, n_ctx=args.ctx, n_threads=n_threads)
+    print(f"[LLM] llama.cpp backend; ctx={args.ctx}; threads={n_threads}; model={model_path.name}")
 
     while True:
         try:
@@ -197,21 +150,15 @@ def main():
             break
         if not q or q == "/q":
             break
+
         qvec = embed_query(q, emb_model, metric)
         hits = retrieve(index, metas, qvec.astype("float32"), topk=args.topk)
         if not hits:
-            print("⛔ Ничего не найдено в индексе.")
+            print("⛔ Ничего не найдено.")
             continue
 
-        messages = build_messages_with_budget(
-            backend=backend,
-            query=q,
-            hits=hits,
-            shots_pairs=max(0, min(args.shots, 2)),
-            ctx_window=args.ctx,
-            max_output_tokens=args.max_out,
-            init_chunk_chars=max(200, args.chunk_chars),
-        )
+        ctx_text = format_context(hits, max_chars_per_chunk=args.chunk_chars)
+        messages = build_messages(q, ctx_text, shots_pairs=args.shots)
 
         try:
             answer = backend.generate(messages, max_tokens=args.max_out)
