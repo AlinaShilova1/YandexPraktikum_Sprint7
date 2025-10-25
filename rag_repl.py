@@ -9,6 +9,7 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 
+# ---------------- Retrieval ----------------
 def l2_normalize(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v, axis=1 if v.ndim == 2 else 0, keepdims=True) + 1e-12
     return v / n
@@ -38,7 +39,8 @@ def retrieve(index, metas, qvec: np.ndarray, topk: int) -> List[Tuple[int, float
         out.append((int(idx), float(dist), metas[int(idx)]))
     return out
 
-FEW_SHOTS = [
+# ---------------- Prompt building ----------------
+BASE_FEW_SHOTS = [
     {"role": "user", "content": "Как называется оружие Мина?"},
     {"role": "assistant", "content": "Оружие Мина называется Нохалбур."},
     {"role": "user", "content": "В какой стране родилась Эйменория?"},
@@ -52,7 +54,7 @@ SYSTEM_PROMPT = (
     "Опирайся исключительно на предоставленные фрагменты контекста."
 )
 
-def format_context(hits: List[Tuple[int, float, Dict]], max_chars_per_chunk: int = 900) -> str:
+def format_context(hits: List[Tuple[int, float, Dict]], max_chars_per_chunk: int) -> str:
     blocks = []
     for rank, (_, score, m) in enumerate(hits, start=1):
         txt = (m.get("text") or "").strip()
@@ -63,7 +65,8 @@ def format_context(hits: List[Tuple[int, float, Dict]], max_chars_per_chunk: int
         blocks.append(f"[CTX {rank}] score={score:.4f} source={src} pos=({pos})\n{txt}")
     return "\n\n".join(blocks)
 
-def build_prompt(query: str, context_blocks: str) -> List[Dict[str, str]]:
+def build_messages(query: str, context_blocks: str, shots_pairs: int) -> List[Dict[str, str]]:
+    shots = BASE_FEW_SHOTS[: max(0, shots_pairs * 2)]
     task = (
         f"Контекст:\n{context_blocks}\n\n"
         f"Вопрос пользователя: {query}\n\n"
@@ -75,51 +78,116 @@ def build_prompt(query: str, context_blocks: str) -> List[Dict[str, str]]:
         f"- Источники:\n"
         f"  • <source #chunk/позиции>\n"
     )
-    return [{"role": "system", "content": SYSTEM_PROMPT}] + FEW_SHOTS + [{"role": "user", "content": task}]
+    return [{"role": "system", "content": SYSTEM_PROMPT}] + shots + [{"role": "user", "content": task}]
 
-def generate_openai(messages: List[Dict[str, str]], model: str = "gpt-4o-mini") -> str:
-    from openai import OpenAI
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY не задан.")
-    client = OpenAI(api_key=api_key)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.2,
-        max_tokens=600
-    )
-    return resp.choices[0].message.content.strip()
+# ---------------- LLM (llama.cpp & OpenAI) ----------------
+class LlamaBackend:
+    def init(self, model_path: str, chat_format: str, n_ctx: int, n_threads: int):
+        from llama_cpp import Llama
+        self.llm = Llama(
+            model_path=model_path,
+            chat_format=chat_format,
+            n_ctx=n_ctx,
+            n_threads=n_threads,
+            verbose=False
+        )
+        self.n_ctx = n_ctx
 
-def generate_llama_cpp(messages: List[Dict[str, str]]) -> str:
-    from llama_cpp import Llama
-    gguf = os.getenv("GGUF_MODEL")
-    if not gguf or not Path(gguf).exists():
-        raise RuntimeError("GGUF_MODEL не задан или файл не найден.")
-    llm = Llama(
-        model_path=gguf,
-        chat_format="qwen",
-        n_ctx=2048,
-        n_threads=max(2, (os.cpu_count() or 4) // 2),
-        verbose=False
-    )
-    out = llm.create_chat_completion(
-        messages=messages,
-        temperature=0.2,
-        top_p=0.9,
-        max_tokens=512,
-        repeat_penalty=1.15
-    )
-    return out["choices"][0]["message"]["content"].strip()
+    def tokenize_len(self, text: str) -> int:
+        toks = self.llm.tokenize(text.encode("utf-8"))
+        return len(toks)
 
+    def messages_token_len(self, messages: List[Dict[str, str]]) -> int:
+        # грубая оценка: склеиваем роли и контент; для chat_format=qwen это приемлемо
+        joined = ""
+        for m in messages:
+            joined += f"{m.get('role','user').strip()}: {m.get('content','').strip()}\n"
+        return self.tokenize_len(joined)
+
+    def generate(self, messages: List[Dict[str, str]], max_tokens: int) -> str:
+        out = self.llm.create_chat_completion(
+            messages=messages,
+            temperature=0.2,
+            top_p=0.9,
+            max_tokens=max_tokens,
+            repeat_penalty=1.15
+        )
+        return out["choices"][0]["message"]["content"].strip()
+
+class OpenAIBackend:
+    def init(self, model: str):
+        from openai import OpenAI
+        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = model
+        self.n_ctx = 8192  # справочная величина; у каждой модели своя
+
+    def messages_token_len(self, messages: List[Dict[str, str]]) -> int:
+        # приблизим длину как по числу символов (OpenAI сам отрубит при превышении)
+        txt = "\n".join([m["role"] + ": " + m["content"] for m in messages])
+        return len(txt) // 3  # грубая эвристика
+
+    def generate(self, messages: List[Dict[str, str]], max_tokens: int) -> str:
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=max_tokens
+        )
+        return resp.choices[0].message.content.strip()
+
+# ---------------- Budgeting ----------------
+def build_messages_with_budget(
+    backend,
+    query: str,
+    hits: List[Tuple[int, float, Dict]],
+    shots_pairs: int,
+    ctx_window: int,
+    max_output_tokens: int,
+    init_chunk_chars: int,
+) -> List[Dict[str, str]]:
+    # резерв под служебные токены
+    reserve = 64
+    chunk_chars = init_chunk_chars
+    use_hits = hits[:]
+    while True:
+        ctx_text = format_context(use_hits, max_chars_per_chunk=chunk_chars)
+        messages = build_messages(query, ctx_text, shots_pairs=shots_pairs)
+        used = backend.messages_token_len(messages)
+        budget = ctx_window - max_output_tokens - reserve
+        if used <= budget:
+            return messages
+        # пробуем сначала укоротить чанки, потом уменьшить их количество
+        if chunk_chars > 200:
+            chunk_chars = int(chunk_chars * 0.75)
+        elif len(use_hits) > 1:
+            use_hits = use_hits[:-1]
+            # немного восстанавливаем длину чанка
+            chunk_chars = max(init_chunk_chars, chunk_chars)
+        else:
+            # крайний случай — уменьшаем few-shots
+            if shots_pairs > 0:
+                shots_pairs -= 1
+            else:
+                # ужимаем max_output_tokens
+                if max_output_tokens > 256:
+                    max_output_tokens = 256
+                else:
+                    # больше никак — вернём то, что есть (LLM сам обрежет)
+                    return messages
+
+# ---------------- REPL ----------------
 def main():
-    ap = argparse.ArgumentParser(description="RAG REPL over FAISS index")
+    ap = argparse.ArgumentParser(description="RAG REPL over FAISS index (with token budgeting)")
     ap.add_argument("--index", default="./index/faiss.index")
     ap.add_argument("--meta", default="./index/meta.jsonl")
     ap.add_argument("--info", default="./index/info.json")
     ap.add_argument("--emb-model", default="intfloat/multilingual-e5-base")
     ap.add_argument("--topk", type=int, default=5)
+    ap.add_argument("--shots", type=int, default=1, help="Количество пар few-shot (0..2)")
     ap.add_argument("--backend", choices=["llama", "openai"], default="llama")
+    ap.add_argument("--ctx", type=int, default=4096, help="Окно контекста для LLM")
+    ap.add_argument("--max-out", type=int, default=512, help="Максимум токенов в ответе")
+    ap.add_argument("--chunk-chars", type=int, default=900, help="Макс. символов на чанк в контексте")
     args = ap.parse_args()
 
     index, info, metas = load_index(Path(args.index), Path(args.info), Path(args.meta))
@@ -127,6 +195,19 @@ def main():
     print(f"[READY] index loaded; metric={metric}; chunks={len(metas)}")
 
     emb_model = SentenceTransformer(args.emb_model, device="cpu")
+    # инициализируем генератор один раз
+    if args.backend == "openai":
+        backend = OpenAIBackend(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+        print("[LLM] OpenAI backend")
+    else:
+        gguf = os.getenv("GGUF_MODEL")
+        if not gguf or not Path(gguf).exists():
+            raise RuntimeError("GGUF_MODEL не задан или файл не найден.")
+        # для Qwen используем правильный формат чата
+        chat_format = os.getenv("CHAT_FORMAT", "qwen")
+        n_threads = max(2, (os.cpu_count() or 4) // 2)
+        backend = LlamaBackend(model_path=gguf, chat_format=chat_format, n_ctx=args.ctx, n_threads=n_threads)
+        print(f"[LLM] llama.cpp backend; ctx={args.ctx}; threads={n_threads}; chat_format={chat_format}")
 
     while True:
         try:
@@ -142,14 +223,18 @@ def main():
             print("⛔ Ничего не найдено в индексе.")
             continue
 
-        ctx = format_context(hits, max_chars_per_chunk=900)
-        messages = build_prompt(q, ctx)
+        messages = build_messages_with_budget(
+            backend=backend,
+            query=q,
+            hits=hits,
+            shots_pairs=max(0, min(args.shots, 2)),
+            ctx_window=args.ctx,
+            max_output_tokens=args.max_out,
+            init_chunk_chars=max(200, args.chunk_chars),
+        )
 
         try:
-            if args.backend == "openai":
-                answer = generate_openai(messages)
-            else:
-                answer = generate_llama_cpp(messages)
+            answer = backend.generate(messages, max_tokens=args.max_out)
         except Exception as e:
             print(f"⚠️ Ошибка генерации: {e}")
             continue
